@@ -242,7 +242,6 @@ void handleFileDelete() {
 		return server.send(404, F("text/plain"), F("FileNotFound"));
 	SPIFFS.remove(path);
 	server.send(200, F("text/plain"), "");
-	//path = String();
 }
 
 void handleTxId() {
@@ -269,10 +268,8 @@ bool loadConfig() {
 		DEBUGLN(F("Config file size is too large"));
 		return false;
 	}
-
 	// Allocate a buffer to store contents of the file.
 	std::unique_ptr<char[]> buf(new char[size]);
-
 	// We don't use String here because ArduinoJson library requires the input
 	// buffer to be mutable. If you don't use ArduinoJson, you may as well
 	// use configFile.readString instead.
@@ -357,7 +354,6 @@ bool loadConfig() {
 		syslog_priority = json[SH("syslog_priority")];
 		DEBUGLN("Loaded syslog_priority: " + String(syslog_priority));
 	}
-
 	return true;
 }
 
@@ -417,7 +413,6 @@ void handleFileUpload() {
 		if (!filename.startsWith("/")) filename = "/" + filename;
 		DEBUGLN("handleFileUpload Name: " + filename);
 		fsUploadFile = SPIFFS.open(filename, "w");
-		//filename = String();
 	}
 	else if (upload.status == UPLOAD_FILE_WRITE) {
 		//DEBUGLN("handleFileUpload Data: " + upload.currentSize);
@@ -447,7 +442,6 @@ void handleFileCreate() {
 	else
 		return server.send(500, "text/plain", "CREATE FAILED");
 	server.send(200, "text/plain", "");
-	//path = String();
 }
 
 void handleFileList() {
@@ -520,4 +514,84 @@ void auxChange(void) {
 			append_log("Aux changed to " + String(new_value));
 		}
 	}
+}
+
+String grep_auth_file() {
+	char buffer[64];
+	char* this_id;
+	byte cnt = 0;
+
+	File file = SPIFFS.open(AUTH_FILE, "r");
+	if (!file) {
+		DEBUGLN(F("Failed to open auth file"));
+		return "";
+	}
+
+	while (file.available() > 0) {
+		char c = file.read();
+		buffer[cnt++] = c;
+		if ((c == '\n') || (cnt == sizeof(buffer) - 1)) {
+			buffer[cnt] = '\0';
+			cnt = 0;
+			this_id = strtok(buffer, " ");
+			if (reader1_string == String(this_id)) {
+				return String(strtok(NULL, "\n"));
+			}
+		}
+	}
+	return "";
+}
+
+void server_init() {
+	server.on("/dos", HTTP_GET, handleDoS);
+	server.on("/txid", HTTP_GET, handleTxId);
+	server.on("/format", HTTP_DELETE, []() {
+		if (basicAuthFailed());
+		if (SPIFFS.format()) server.send(200, "text/plain", "Format success!");
+		});
+	//list directory
+	server.on("/list", HTTP_GET, handleFileList);
+	//load editor
+	server.on("/edit", HTTP_GET, []() {
+		if (basicAuthFailed());
+		if (!handleFileRead("/static/edit.htm")) server.send(404, "text/plain", "FileNotFound");
+		});
+	//create file
+	server.on("/edit", HTTP_PUT, handleFileCreate);
+	//delete file
+	server.on("/edit", HTTP_DELETE, handleFileDelete);
+	//first callback is called after the request has ended with all parsed arguments
+	//second callback handles file uploads at that location
+	server.on("/edit", HTTP_POST, []() { server.send(200, "text/plain", ""); }, handleFileUpload);
+	server.on("/restart", HTTP_GET, handleRestart);
+	//called when the url is not defined here
+	//use it to load content from SPIFFS
+	server.onNotFound([]() {
+		if (basicAuthFailed()) return;
+		if (!handleFileRead(server.uri()))
+			server.send(404, "text/plain", "FileNotFound");
+		});
+
+	server.on("/version", HTTP_GET, []() {
+		if (basicAuthFailed()) return;
+		String json = "{\"version\":\"" + String(VERSION) + "\",\"log_name\":\"" + String(log_name) + "\",\"ChipID\":\"" + String(ESP.getChipId(), HEX) + "\"}\n";
+		server.send(200, "text/json", json);
+		json = String();
+		});
+	//get heap status, analog input value and all GPIO statuses in one json call
+	server.on("/all", HTTP_GET, []() {
+		if (basicAuthFailed()) return;
+		String json = "{";
+		json += "\"heap\":" + String(ESP.getFreeHeap());
+		json += ", \"analog\":" + String(analogRead(A0));
+		json += ", \"gpio\":" + String((uint32_t)(((GPI | GPO) & 0xFFFF) | ((GP16I & 0x01) << 16)));
+		json += "}";
+		server.send(200, "text/json", json);
+		json = String();
+		});
+	server.serveStatic("/static", SPIFFS, "/static", "max-age=86400");
+	httpUpdater.setup(&server);	// This doesn't do authentication
+	server.begin();
+	MDNS.addService("http", "tcp", 80);
+	DEBUGLN(F("HTTP server started"));
 }
