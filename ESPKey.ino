@@ -12,18 +12,22 @@ void setup() {
 	pinMode(D0_SENSE, OUTPUT_OPEN_DRAIN);
 	pinMode(D1_SENSE, OUTPUT_OPEN_DRAIN);
 	pinMode(LED_SENSE, OUTPUT_OPEN_DRAIN);
-	pinMode(CONF_RESET, OUTPUT_OPEN_DRAIN);
-
+	pinMode(CONF_RESET, INPUT_PULLUP);
+	pinMode(2, OUTPUT_OPEN_DRAIN); delay(5000);
 	// Input interrupts
-	attachInterrupt(digitalPinToInterrupt(D0_SENSE), reader1_D0_trigger, FALLING);
-	attachInterrupt(digitalPinToInterrupt(D1_SENSE), reader1_D1_trigger, FALLING);
-	attachInterrupt(digitalPinToInterrupt(LED_SENSE), auxChange, CHANGE);
-	attachInterrupt(digitalPinToInterrupt(CONF_RESET), resetConfig, CHANGE);
+	//attachInterrupt(digitalPinToInterrupt(D0_SENSE), reader1_D0_trigger, FALLING);
+	//attachInterrupt(digitalPinToInterrupt(D1_SENSE), reader1_D1_trigger, FALLING);
+	//attachInterrupt(digitalPinToInterrupt(LED_SENSE), auxChange, CHANGE);
+	//attachInterrupt(digitalPinToInterrupt(CONF_RESET), resetConfig, CHANGE);
 #ifdef DEBUG_ENABLE
 	Serial.begin(115200);
 	delay(100);
-	Serial.setDebugOutput(true);
-	DEBUGLN("Chip ID: 0x" + String(ESP.getChipId(), HEX));
+	//Serial.setDebugOutput(true);
+	led_blink();
+	DEBUGLN("Chip ID: 0x" + String(ESP.getChipId(), HEX)); delay(2000);
+	digitalWrite(2, 0); 
+	while (true) {}
+
 #endif // DEBUG_ENABLE
 	// Set Hostname.
 	String dhcp_hostname(HOSTNAME);
@@ -128,11 +132,11 @@ void setup() {
 }
 
 void loop() {
-	static String name;
 	// Check for card reader data
-	if (reader1_count >= CARD_LEN && (reader1_millis + 5 <= millis() || millis() < 10)) {
-		fix_reader1_string();
-		name = grep_auth_file();
+	if (reader_count && (millis() > reader1_millis + 5 /*|| millis() < 10*/)) {
+		//fix_reader_string();
+		reader_string = String(reader_code, HEX); reader_string += ':' + String(reader_count);
+		String name(grep_auth_file());
 		if (name != "") {
 			if (toggle_pin(LED_SENSE)) {
 				name += " enabled " + String(log_name);
@@ -143,14 +147,12 @@ void loop() {
 			append_log(name);
 			syslog(name);
 		}
-		else if (reader1_string == DoS_id) {
-			digitalWrite(D0_SENSE, HIGH);
-			append_log("DoS mode enabled by control card");
-		}
-		else {
-			append_log(reader1_string);
-		}
-		reader1_reset();
+		//else if (reader_string == DoS_id) {
+		//	digitalWrite(D0_SENSE, HIGH);
+		//	append_log("DoS mode enabled by control card");
+		//}
+		else append_log(reader_string);
+		reader_reset();
 	}
 
 	// Check for HTTP requests
