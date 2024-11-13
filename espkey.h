@@ -26,18 +26,18 @@
 #define HOSTNAME "ESPKey-" // Hostname prefix for DHCP/OTA
 #define CONFIG_FILE "/config.json"
 #define AUTH_FILE "/auth.txt"
-#define DBG_OUTPUT_PORT Serial	// This could be a file with some hacking
 #define CARD_LEN 4     // minimum card length in bits
 #define PULSE_WIDTH 200 // length of asserted pulse in microSeconds
 #define PULSE_GAP 2000 - PULSE_WIDTH   // delay between pulses in microSeconds
 
 // Pin number assignments
 //#define D0_ASSERT 12
-#define D0_SENSE 13
+#define D0_SENSE 4
 //#define D1_ASSERT 16
-#define D1_SENSE 14
+#define D1_SENSE 5
 //#define LED_ASSERT 4
 #define LED_SENSE 5
+#define LED 2
 #define CONF_RESET 0
 
 #if defined ESP32
@@ -59,6 +59,16 @@
 #define CHECK_(x) (void)(x);
 #endif
 
+#if defined CONFIG_IDF_TARGET_ESP32C3 || defined ESP8266
+#define LED_ON	0
+#define LED_OFF	1
+#else
+#define LED_ON	1
+#define LED_OFF	0
+#endif
+#define LED_DELAY 100
+#define LED_BLINK_COUNT 5
+
 // Default settings used when no configuration file exists
 char log_name[20] = "Alpha";
 bool ap_enable = true;
@@ -69,7 +79,7 @@ char ap_psk[20] = "accessgranted"; // Default PSK.
 char station_ssid[20] = "";
 char station_psk[20] = "";
 char mDNShost[20] = "ESPKey";
-String DoS_id = "7fffffff:31";
+String DoS_id = "1ffffff:26";
 char ota_password[24] = "ExtraSpecialPassKey";
 char www_username[20] = "";
 char www_password[20] = "";
@@ -87,27 +97,30 @@ File fsUploadFile;
 //byte incoming_byte = 0; 
 unsigned long config_reset_millis = 30000;
 
-volatile byte reader1_byte = 0;
-String reader1_string = "";
-volatile int reader1_count = 0;
-volatile unsigned long reader1_millis = 0;
-volatile unsigned long aux_change = 0;
+volatile uint64_t reader_code = 0;
+String reader_string = "";
+volatile byte reader_count = 0;
+volatile uint32_t reader1_millis = 0;
+volatile uint32_t aux_change = 0;
 volatile byte last_aux = 1;
 volatile byte expect_aux = 2;
-
+void led_blink(byte count = LED_BLINK_COUNT, byte led_delay = LED_DELAY) {
+	while (count--) {
+		digitalWrite(LED, LED_ON);
+		delay(led_delay);
+		digitalWrite(LED, LED_OFF);
+		delay(led_delay);
+	}
+}
 void IRAM_ATTR reader1_D0_trigger(void) {
 	reader1_millis = millis();
-	reader1_count++;
-	if (!(reader1_count & 3)) { //%4
-		reader1_string += String(reader1_byte, HEX);
-		reader1_byte = 0;
-		return;
-	}
-	reader1_byte <<= 1;
+	reader_count++;
+	reader_code <<= 1;
 }
+
 void IRAM_ATTR reader1_D1_trigger(void) {
-	reader1_byte |= 1;
 	reader1_D0_trigger();
+	reader_code |= 1;
 }
 
 byte char_to_byte(char in) {
@@ -122,29 +135,29 @@ char c2h(byte c) {
 	return "0123456789ABCDEF"[0xF & c];
 }
 
-void fix_reader1_string() {
-	byte loose_bits = reader1_count & 3; //%4
+void fix_reader_string() {
+	byte loose_bits = reader_count & 3; //%4
 	if (loose_bits) {
 		byte moving_bits = 4 - loose_bits;
 		byte moving_mask = (1 << moving_bits) - 1;
 		DEBUGLN("lb: " + String(loose_bits) + " mb: " + String(moving_bits) + " mm: " + String(moving_mask, HEX));
-		byte BYTE = char_to_byte(reader1_string.charAt(0));
-		uint32_t str_len = reader1_string.length();
+		byte BYTE = char_to_byte(reader_string[0]);
+		uint32_t str_len = reader_string.length();
 		for (uint32_t i = 0; i < str_len; i++) {
-			reader1_string.setCharAt(i, c2h(BYTE >> moving_bits));
+			reader_string[i] = c2h(BYTE >> moving_bits);
 			BYTE &= moving_mask;
-			BYTE = (BYTE << 4) | char_to_byte(reader1_string.charAt(i + 1));
-			DEBUGLN("BYTE: " + String(BYTE, HEX) + " i: " + String(reader1_string.charAt(i)));
+			BYTE = (BYTE << 4) | char_to_byte(reader_string.charAt(i + 1));
+			DEBUGLN("BYTE: " + String(BYTE, HEX) + " i: " + String(reader_string.charAt(i)));
 		}
-		reader1_string += String((BYTE >> moving_bits) | reader1_byte, HEX);
+		reader_string += String((BYTE >> moving_bits) | reader_code, HEX);
 	}
-	reader1_string += ":" + String(reader1_count);
+	reader_string += ':' + String(reader_count);
 }
 
-void reader1_reset() {
-	reader1_byte = 0;
-	reader1_count = 0;
-	reader1_string = "";
+void reader_reset() {
+	reader_code = 0;
+	reader_count = 0;
+	reader_string = "";
 }
 
 byte toggle_pin(byte pin) {
@@ -154,24 +167,22 @@ byte toggle_pin(byte pin) {
 	return new_value;
 }
 
-void transmit_assert(const byte pin) {
-	digitalWrite(pin, HIGH);
+void transmit_assert(bool bit) {
+	bit ? digitalWrite(D1_SENSE, LOW) : digitalWrite(D0_SENSE, LOW);
 	delayMicroseconds(PULSE_WIDTH);
-	digitalWrite(pin, LOW);
+	bit ? digitalWrite(D1_SENSE, HIGH) : digitalWrite(D0_SENSE, HIGH);
 	delayMicroseconds(PULSE_GAP);
 }
 
-void transmit_id_nope(uint32_t sendValue, byte bitcount) {
-	DEBUGLN("[-] Sending Data: " + String(sendValue, HEX) + ':' + String(bitcount)); DEBUG('\t');
-	for (short x = bitcount - 1; x >= 0; x--) {
-		if (bitRead(sendValue, x)) transmit_assert(D1_SENSE);
-		else transmit_assert(D0_SENSE);
+void transmit_id_nope(uint64_t sendValue, byte bitcount) {
+	DEBUGLN("[-] Sending Data: " + String(sendValue, HEX) + ':' + String(bitcount)); DEBUGLN();
+	for (uint64_t bitmask = 1 << (bitcount-1); bitmask; bitmask>>=1) {
+		transmit_assert(sendValue & bitmask);
 	}
-	DEBUGLN();
 }
 
 void transmit_id(String sendValue, uint32_t bitcount) {
-	DEBUGLN("Sending data: " + sendValue + ":" + String(bitcount));
+	DEBUGLN("Sending data: " + sendValue + ':' + bitcount);
 	uint32_t bits_available = sendValue.length() << 2; //* 4
 	uint32_t excess_bits = 0;
 	if (bits_available > bitcount) {
@@ -186,11 +197,11 @@ void transmit_id(String sendValue, uint32_t bitcount) {
 		}
 	}
 	for (uint32_t i = 0; i < sendValue.length(); i++) {
-		byte c = char_to_byte(sendValue.charAt(i));
-		DEBUGF("i: %u  BYTE:0x%u\n", i , c);
+		byte BYTE = char_to_byte(sendValue.charAt(i));
+		DEBUGF("i: %u  BYTE:0x%u\n", i , BYTE);
 		for (short x = 3 - excess_bits; x >= 0; x--) {
 			//DEBUGLN("x:" + String(x) + " b:" + b);
-			if (bitRead(c, x)) {
+			if (bitRead(BYTE, x)) {
 				transmit_assert(D1_SENSE);
 			}
 			else {
@@ -242,16 +253,18 @@ void handleFileDelete() {
 		return server.send(404, F("text/plain"), F("FileNotFound"));
 	SPIFFS.remove(path);
 	server.send(200, F("text/plain"), "");
+	//path = String();
 }
 
 void handleTxId() {
 	if (!server.hasArg("v")) { server.send(500, F("text/plain"), F("BAD ARGS")); return; }
-	String value = server.arg("v");
-	//DEBUGLN("handleTxId: " + value);
-	String sendValue = value.substring(0, value.indexOf(":"));
-	sendValue.toUpperCase();
-	uint32_t bitcount = value.substring(value.indexOf(":") + 1).toInt();
-	transmit_id(sendValue, bitcount);
+	const String& value = server.arg("v");
+	DEBUGLN("handleTxId: " + value);
+	const char* str = value.c_str();
+	char* colon = strchr(str, ':');
+	uint64_t sendValue = strtoull(str,&colon,16);
+	byte bitcount = strtoul(colon+1, NULL, 10);
+	transmit_id_nope(sendValue, bitcount);
 	server.send(200, F("text/plain"), "");
 }
 
@@ -270,6 +283,7 @@ bool loadConfig() {
 	}
 	// Allocate a buffer to store contents of the file.
 	std::unique_ptr<char[]> buf(new char[size]);
+
 	// We don't use String here because ArduinoJson library requires the input
 	// buffer to be mutable. If you don't use ArduinoJson, you may as well
 	// use configFile.readString instead.
@@ -354,6 +368,7 @@ bool loadConfig() {
 		syslog_priority = json[SH("syslog_priority")];
 		DEBUGLN("Loaded syslog_priority: " + String(syslog_priority));
 	}
+
 	return true;
 }
 
@@ -413,9 +428,10 @@ void handleFileUpload() {
 		if (!filename.startsWith("/")) filename = "/" + filename;
 		DEBUGLN("handleFileUpload Name: " + filename);
 		fsUploadFile = SPIFFS.open(filename, "w");
+		//filename = String();
 	}
 	else if (upload.status == UPLOAD_FILE_WRITE) {
-		//DEBUGLN("handleFileUpload Data: " + upload.currentSize);
+		DEBUGLN("handleFileUpload Data: " + upload.currentSize);
 		if (fsUploadFile)
 			fsUploadFile.write(upload.buf, upload.currentSize);
 	}
@@ -442,6 +458,7 @@ void handleFileCreate() {
 	else
 		return server.send(500, "text/plain", "CREATE FAILED");
 	server.send(200, "text/plain", "");
+	//path = String();
 }
 
 void handleFileList() {
@@ -534,7 +551,7 @@ String grep_auth_file() {
 			buffer[cnt] = '\0';
 			cnt = 0;
 			this_id = strtok(buffer, " ");
-			if (reader1_string == String(this_id)) {
+			if (reader_string == String(this_id)) {
 				return String(strtok(NULL, "\n"));
 			}
 		}
@@ -564,6 +581,7 @@ void server_init() {
 	//second callback handles file uploads at that location
 	server.on("/edit", HTTP_POST, []() { server.send(200, "text/plain", ""); }, handleFileUpload);
 	server.on("/restart", HTTP_GET, handleRestart);
+
 	//called when the url is not defined here
 	//use it to load content from SPIFFS
 	server.onNotFound([]() {
@@ -576,7 +594,6 @@ void server_init() {
 		if (basicAuthFailed()) return;
 		String json = "{\"version\":\"" + String(VERSION) + "\",\"log_name\":\"" + String(log_name) + "\",\"ChipID\":\"" + String(ESP.getChipId(), HEX) + "\"}\n";
 		server.send(200, "text/json", json);
-		json = String();
 		});
 	//get heap status, analog input value and all GPIO statuses in one json call
 	server.on("/all", HTTP_GET, []() {
@@ -587,7 +604,6 @@ void server_init() {
 		json += ", \"gpio\":" + String((uint32_t)(((GPI | GPO) & 0xFFFF) | ((GP16I & 0x01) << 16)));
 		json += "}";
 		server.send(200, "text/json", json);
-		json = String();
 		});
 	server.serveStatic("/static", SPIFFS, "/static", "max-age=86400");
 	httpUpdater.setup(&server);	// This doesn't do authentication
