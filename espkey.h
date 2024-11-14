@@ -11,12 +11,23 @@
 * excellent reference: https://github.com/brad-anton/VertX
 *
 */
-#include <ESP8266WiFi.h>
+
 #include <WiFiUdp.h>
+WiFiUDP Udp;
+#ifdef ESP8266
 #include <WiFiClient.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 #include <ESP8266HTTPUpdateServer.h>
+ESP8266WebServer server(80);
+ESP8266HTTPUpdateServer httpUpdater;
+#else
+#include <WiFiServer.h>
+#include <HTTPUpdateServer.h>
+WiFiServer server(80);
+HTTPUpdateServer httpUpdater;
+#include <SPIFFS.h>
+#endif
 #include <FS.h>
 #include <ArduinoOTA.h>
 #include <GSON.h>
@@ -70,29 +81,24 @@
 #define LED_BLINK_COUNT 5
 
 // Default settings used when no configuration file exists
-char log_name[20] = "Alpha";
-bool ap_enable = true;
-bool ap_hidden = false;
-char ap_ssid[20] = "ESPKey-config"; // Default SSID.
+String log_name("Alpha");
+String ap_ssid("ESPKey"); // Default SSID.
 IPAddress ap_ip(192, 168, 4, 1);
-char ap_psk[20] = "accessgranted"; // Default PSK.
-char station_ssid[20] = "";
-char station_psk[20] = "";
-char mDNShost[20] = "ESPKey";
-String DoS_id = "1ffffff:26";
-char ota_password[24] = "ExtraSpecialPassKey";
-char www_username[20] = "";
-char www_password[20] = "";
+String ap_psk = "accessgranted"; // Default PSK.
+String station_ssid;
+String station_psk;
+String mDNShost("ESPKey");
+String DoS_id("1ffffff:26");
+String ota_password("ExtraSpecialPassKey");
+String www_username;
+String www_password;
+String syslog_service_name("accesscontrol");
+String syslog_host("ESPKey");
 IPAddress syslog_server(0, 0, 0, 0);
 unsigned int syslog_port = 514;
-char syslog_service_name[20] = "accesscontrol";
-char syslog_host[20] = "ESPKey";
+bool ap_enable = true;
+bool ap_hidden = false;
 byte syslog_priority = 36;
-
-WiFiUDP Udp;
-ESP8266WebServer server(80);
-ESP8266HTTPUpdateServer httpUpdater;
-File fsUploadFile;
 
 //byte incoming_byte = 0; 
 unsigned long config_reset_millis = 30000;
@@ -175,7 +181,7 @@ void transmit_assert(bool bit) {
 }
 
 void transmit_id_nope(uint64_t sendValue, byte bitcount) {
-	DEBUGLN("[-] Sending Data: " + String(sendValue, HEX) + ':' + String(bitcount)); DEBUGLN();
+	DEBUGLN("[-] Sending Data: " + String(sendValue, HEX) + ':' + String(bitcount)+'\n');
 	for (uint64_t bitmask = 1 << (bitcount-1); bitmask; bitmask>>=1) {
 		transmit_assert(sendValue & bitmask);
 	}
@@ -228,13 +234,13 @@ void syslog(String text) {
 	text = '<' + String(syslog_priority) + '>' + String(syslog_host) + ' ' + String(syslog_service_name) + ": " + text;
 	text.toCharArray(buf, sizeof(buf) - 1);
 	Udp.beginPacket(syslog_server, syslog_port);
-	Udp.write(buf);
+	Udp.write((uint8_t*)buf, sizeof(buf));
 	Udp.endPacket();
 }
 
 bool basicAuthFailed() {
-	if (strlen(www_username) > 0 && strlen(www_password) > 0) {
-		if (!server.authenticate(www_username, www_password)) {
+	if (www_username.length() && www_password.length()) {
+		if (!server.authenticate(www_username.c_str(), www_password.c_str())) {
 			server.requestAuthentication();
 			return true;
 		}
@@ -253,7 +259,6 @@ void handleFileDelete() {
 		return server.send(404, F("text/plain"), F("FileNotFound"));
 	SPIFFS.remove(path);
 	server.send(200, F("text/plain"), "");
-	//path = String();
 }
 
 void handleTxId() {
@@ -277,6 +282,7 @@ bool loadConfig() {
 	}
 
 	size_t size = configFile.size();
+	DEBUGF("File size %lu\n", size);
 	if (size > 1024) {
 		DEBUGLN(F("Config file size is too large"));
 		return false;
@@ -293,79 +299,79 @@ bool loadConfig() {
 	json.hashKeys();
 	//StaticJsonBuffer<1024> jsonBuffer;
 	//JsonObject& json = jsonBuffer.parseObject(buf.get());
-	DEBUG(F("Parse config file "));
-	if (json.hasError()) {
-		DEBUGF("failed, %s in %u\n",json.readError(), json.errorIndex());
-		return false;
-	}else DEBUGLN(F("done"));
+	//DEBUG(F("Parse config file "));
+	//if (json.hasError()) {
+	//	DEBUGF("failed, %s in %u\n",json.readError(), json.errorIndex());
+	//	return false;
+	//}else DEBUGLN(F("done"));
 
 	// FIXME these should be testing for valid input before replacing defaults
 	if (json.has(SH("log_name"))) {
-		strncpy(log_name, json[SH("log_name")].str(), sizeof(log_name));
-		DEBUGLN("Loaded log_name: " + String(log_name));
+		json[SH("log_name")].value().toString(log_name);
+		DEBUGLN("Loaded log_name: " + log_name);
 	}
 	if (json.has(SH("ap_enable"))) {
-		ap_enable = (strcmp(json[SH("ap_enable")].str(), "true") == 0) ? true : false;
+		ap_enable = json[SH("ap_enable")].value().toBool();
 		DEBUGLN("Loaded ap_enable: " + String(ap_enable));
 	}
 	if (json.has(SH("ap_hidden"))) {
-		ap_hidden = (strcmp(json[SH("ap_hidden")].str(), "true") == 0) ? true : false;
+		ap_hidden = json[SH("ap_hidden")].value().toBool();
 		DEBUGLN("Loaded ap_hidden: " + String(ap_hidden));
 	}
 	if (json.has(SH("ap_ssid"))) {
-		strncpy(ap_ssid, json[SH("ap_ssid")].str(), 20);
-		DEBUGLN("Loaded ap_ssid: " + String(ap_ssid));
+		json[SH("ap_ssid")].value().toString(ap_ssid);
+		DEBUGLN("Loaded ap_ssid: " + ap_ssid);
 	}
 	if (json.has(SH("ap_psk"))) {
-		strncpy(ap_psk, json[SH("ap_psk")].str(), sizeof(ap_psk));
-		DEBUGLN("Loaded ap_psk: " + String(ap_psk));
+		json[SH("ap_psk")].value().toString(ap_psk);
+		DEBUGLN("Loaded ap_psk: " + ap_psk);
 	}
 	if (json.has(SH("station_ssid"))) {
-		strncpy(station_ssid, json[SH("station_ssid")].str(), sizeof(station_ssid));
-		DEBUGLN("Loaded station_ssid: " + String(station_ssid));
+		json[SH("station_ssid")].value().toString(station_ssid);
+		DEBUGLN("Loaded station_ssid: " + station_ssid);
 	}
 	if (json.has(SH("station_psk"))) {
-		strncpy(station_psk, json[SH("station_psk")].str(), sizeof(station_psk));
-		DEBUGLN("Loaded station_psk: " + String(station_psk));
+		json[SH("station_psk")].value().toString(station_psk);
+		DEBUGLN("Loaded station_psk: " + station_psk);
 	}
 	if (json.has(SH("mDNShost"))) {
-		strncpy(mDNShost, json[SH("mDNShost")].str(), sizeof(mDNShost));
-		DEBUGLN("Loaded mDNShost: " + String(mDNShost));
+		json[SH("mDNShost")].value().toString(mDNShost);
+		DEBUGLN("Loaded mDNShost: " + mDNShost);
 	}
 	if (json.has(SH("DoS_id"))) {
-		DoS_id = json[SH("DoS_id")].str();
+		json[SH("DoS_id")].value().toString(DoS_id);
 		DEBUGLN("Loaded DoS_id: " + DoS_id);
 	}
 	if (json.has(SH("ota_password"))) {
-		strncpy(ota_password, json[SH("ota_password")].str(), sizeof(ota_password));
-		DEBUGLN("Loaded ota_password: " + String(ota_password));
+		json[SH("ota_password")].value().toString(ota_password);
+		DEBUGLN("Loaded ota_password: " + ota_password);
 	}
 	if (json.has(SH("www_username"))) {
-		strncpy(www_username, json[SH("www_username")].str(), sizeof(www_username));
-		DEBUGLN("Loaded www_username: " + String(www_username));
+		json[SH("www_username")].value().toString(www_username);
+		DEBUGLN("Loaded www_username: " + www_username);
 	}
 	if (json.has(SH("www_password"))) {
-		strncpy(www_password, json[SH("www_password")].str(), sizeof(www_password));
-		DEBUGLN("Loaded www_password: " + String(www_password));
+		json[SH("www_password")].value().toString(www_password);
+		DEBUGLN("Loaded www_password: " + www_password);
 	}
 	if (json.has(SH("syslog_server"))) {
-		syslog_server.fromString(json[SH("syslog_server")]);
+		syslog_server.fromString(json[SH("syslog_server")].value());
 		DEBUGLN("Loaded syslog_server: " + syslog_server.toString());
 	}
 	if (json.has(SH("syslog_port"))) {
-		syslog_port = json[SH("syslog_port")];
+		syslog_port = json[SH("syslog_port")].value();
 		DEBUGLN("Loaded syslog_port: " + String(syslog_port));
 	}
 	if (json.has(SH("syslog_service_name"))) {
-		strncpy(syslog_service_name, json[SH("syslog_service_name")].str(), sizeof(syslog_service_name));
+		json[SH("syslog_service_name")].value().toString(syslog_service_name);
 		DEBUGLN("Loaded syslog_service_name: " + String(syslog_service_name));
 	}
 	if (json.has(SH("syslog_host"))) {
-		strncpy(syslog_host, json[SH("syslog_host")].str(), sizeof(syslog_host));
+		json[SH("syslog_host")].value().toString(syslog_host);
 		DEBUGLN("Loaded syslog_host: " + String(syslog_host));
 	}
 	if (json.has(SH("syslog_priority"))) {
-		syslog_priority = json[SH("syslog_priority")];
+		syslog_priority = json[SH("syslog_priority")].value();
 		DEBUGLN("Loaded syslog_priority: " + String(syslog_priority));
 	}
 
@@ -420,8 +426,8 @@ bool handleFileRead(String path) {
 }
 
 void handleFileUpload() {
-	if (basicAuthFailed()) return;
-	if (server.uri() != F("/edit")) return;
+	if (basicAuthFailed() || server.uri() != F("/edit")) return;
+	File fsUploadFile;
 	HTTPUpload& upload = server.upload();
 	if (upload.status == UPLOAD_FILE_START) {
 		String filename = upload.filename;
@@ -458,7 +464,6 @@ void handleFileCreate() {
 	else
 		return server.send(500, "text/plain", "CREATE FAILED");
 	server.send(200, "text/plain", "");
-	//path = String();
 }
 
 void handleFileList() {
@@ -467,16 +472,18 @@ void handleFileList() {
 
 	String path = server.arg("dir");
 	DEBUGLN("handleFileList: " + path);
-	Dir dir = SPIFFS.openDir(path);
-	//path = String();
-
 	String output = "[";
+#ifdef ESP8266
+	Dir dir = SPIFFS.openDir(path);
+	File entry;
 	while (dir.next()) {
-		File entry = dir.openFile("r");
+#else
+	File dir = SPIFFS.open(path);
+	for (File entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
+#endif // ESP8266
 		if (output != "[") output += ',';
-		bool isDir = false;
 		output += "{\"type\":\"";
-		output += (isDir) ? "dir" : "file";
+		output += entry.isDirectory() ? "dir" : "file";
 		output += "\",\"name\":\"";
 		output += entry.name();//String(entry.name()).substring(1);
 		output += "\"}";
@@ -581,7 +588,6 @@ void server_init() {
 	//second callback handles file uploads at that location
 	server.on("/edit", HTTP_POST, []() { server.send(200, "text/plain", ""); }, handleFileUpload);
 	server.on("/restart", HTTP_GET, handleRestart);
-
 	//called when the url is not defined here
 	//use it to load content from SPIFFS
 	server.onNotFound([]() {
@@ -589,25 +595,31 @@ void server_init() {
 		if (!handleFileRead(server.uri()))
 			server.send(404, "text/plain", "FileNotFound");
 		});
-
 	server.on("/version", HTTP_GET, []() {
 		if (basicAuthFailed()) return;
-		String json = "{\"version\":\"" + String(VERSION) + "\",\"log_name\":\"" + String(log_name) + "\",\"ChipID\":\"" + String(ESP.getChipId(), HEX) + "\"}\n";
+		String json = "{\"version\":\"" + String(VERSION) + "\",\"log_name\":\"" + String(log_name) + "\",\"ChipID\":\"" + String(ESP.
+#ifdef ESP8266
+			getChipId()
+#else
+			getChipModel()
+#endif
+			
+			, HEX) + "\"}\n";
 		server.send(200, "text/json", json);
 		});
 	//get heap status, analog input value and all GPIO statuses in one json call
 	server.on("/all", HTTP_GET, []() {
 		if (basicAuthFailed()) return;
-		String json = "{";
-		json += "\"heap\":" + String(ESP.getFreeHeap());
-		json += ", \"analog\":" + String(analogRead(A0));
-		json += ", \"gpio\":" + String((uint32_t)(((GPI | GPO) & 0xFFFF) | ((GP16I & 0x01) << 16)));
-		json += "}";
-		server.send(200, "text/json", json);
+		//String json = "{";
+		//json += "\"heap\":" + String(ESP.getFreeHeap());
+		//json += ", \"analog\":" + String(analogRead(A0));
+		//json += ", \"gpio\":" + String((uint32_t)(((GPI | GPO) & 0xFFFF) | ((GP16I & 0x01) << 16)));
+		//json += "}";
+		//server.send(200, "text/json", json);
 		});
 	server.serveStatic("/static", SPIFFS, "/static", "max-age=86400");
 	httpUpdater.setup(&server);	// This doesn't do authentication
 	server.begin();
-	MDNS.addService("http", "tcp", 80);
+	//MDNS.addService("http", "tcp", 80);
 	DEBUGLN(F("HTTP server started"));
 }
