@@ -15,6 +15,7 @@
 #include <WiFiUdp.h>
 WiFiUDP Udp;
 #ifdef ESP8266
+#define uS micros64()
 #include <WiFiClient.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
@@ -22,6 +23,7 @@ WiFiUDP Udp;
 ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 #else
+#define uS esp_timer_get_time()
 #include <WiFiServer.h>
 #include <HTTPUpdateServer.h>
 WiFiServer server(80);
@@ -34,20 +36,20 @@ HTTPUpdateServer httpUpdater;
 #include <StringUtils.h>
 
 #define VERSION "131"
-#define HOSTNAME "ESPKey-" // Hostname prefix for DHCP/OTA
+#define HOSTNAME "ESPKey" // Hostname prefix for DHCP/OTA
 #define CONFIG_FILE "/config.json"
 #define AUTH_FILE "/auth.txt"
 #define CARD_LEN 4     // minimum card length in bits
 #define PULSE_WIDTH 200 // length of asserted pulse in microSeconds
-#define PULSE_GAP 2000 - PULSE_WIDTH   // delay between pulses in microSeconds
+#define PULSE_DELTA 2000   // delay between pulses in microSeconds
 
 // Pin number assignments
 //#define D0_ASSERT 12
-#define D0_SENSE 4
+#define PIN_D0 4
 //#define D1_ASSERT 16
-#define D1_SENSE 5
+#define PIN_D1 5
 //#define LED_ASSERT 4
-#define LED_SENSE 5
+#define PIN_LED 2
 #define LED 2
 #define CONF_RESET 0
 
@@ -82,9 +84,9 @@ HTTPUpdateServer httpUpdater;
 
 // Default settings used when no configuration file exists
 String log_name("Alpha");
-String ap_ssid("ESPKey"); // Default SSID.
+String ap_ssid(HOSTNAME); // Default SSID.
 IPAddress ap_ip(192, 168, 4, 1);
-String ap_psk = "accessgranted"; // Default PSK.
+String ap_psk("accessgranted"); // Default PSK.
 String station_ssid;
 String station_psk;
 String mDNShost("ESPKey");
@@ -100,16 +102,18 @@ bool ap_enable = true;
 bool ap_hidden = false;
 byte syslog_priority = 36;
 
-//byte incoming_byte = 0; 
 unsigned long config_reset_millis = 30000;
 
+String reader_string;
 volatile uint64_t reader_code = 0;
-String reader_string = "";
+volatile uint64_t reader_last = 0;
+volatile uint32_t reader_delta = 0;
 volatile byte reader_count = 0;
-volatile uint32_t reader1_millis = 0;
-volatile uint32_t aux_change = 0;
+/*
 volatile byte last_aux = 1;
 volatile byte expect_aux = 2;
+volatile uint32_t aux_change = 0;
+*/
 void led_blink(byte count = LED_BLINK_COUNT, byte led_delay = LED_DELAY) {
 	while (count--) {
 		digitalWrite(LED, LED_ON);
@@ -119,7 +123,9 @@ void led_blink(byte count = LED_BLINK_COUNT, byte led_delay = LED_DELAY) {
 	}
 }
 void IRAM_ATTR reader1_D0_trigger(void) {
-	reader1_millis = millis();
+	uint64_t time = uS;
+	if(reader_last) reader_delta += time - reader_last;
+	reader_last = time;
 	reader_count++;
 	reader_code <<= 1;
 }
@@ -163,27 +169,22 @@ void fix_reader_string() {
 void reader_reset() {
 	reader_code = 0;
 	reader_count = 0;
-	reader_string = "";
+	reader_last = 0;
+	reader_delta = 0;
+	//reader_string = "";
 }
 
-byte toggle_pin(byte pin) {
-	byte new_value = !digitalRead(pin);
-	if (pin == LED_SENSE) expect_aux = !new_value;
-	digitalWrite(pin, new_value);
-	return new_value;
-}
-
-void transmit_assert(bool bit) {
-	bit ? digitalWrite(D1_SENSE, LOW) : digitalWrite(D0_SENSE, LOW);
+void transmit_assert(bool bit, const uint16_t pulse_delta = PULSE_DELTA) {
+	bit ? digitalWrite(PIN_D1, LOW) : digitalWrite(PIN_D0, LOW);
 	delayMicroseconds(PULSE_WIDTH);
-	bit ? digitalWrite(D1_SENSE, HIGH) : digitalWrite(D0_SENSE, HIGH);
-	delayMicroseconds(PULSE_GAP);
+	bit ? digitalWrite(PIN_D1, HIGH) : digitalWrite(PIN_D0, HIGH);
+	delayMicroseconds(pulse_delta - PULSE_WIDTH);
 }
 
-void transmit_id_nope(uint64_t sendValue, byte bitcount) {
-	DEBUGLN("[-] Sending Data: " + String(sendValue, HEX) + ':' + String(bitcount)+'\n');
-	for (uint64_t bitmask = 1 << (bitcount-1); bitmask; bitmask>>=1) {
-		transmit_assert(sendValue & bitmask);
+void transmit_id_nope(uint64_t sendValue, byte bitcount, uint16_t pulse_delta = PULSE_DELTA) {
+	DEBUGLN("[-] Sending Data: " + String(sendValue, HEX) + ':' + String(bitcount) + '\n');
+	for (uint64_t bitmask = 1 << (bitcount - 1); bitmask; bitmask >>= 1) {
+		transmit_assert(sendValue & bitmask, pulse_delta);
 	}
 }
 
@@ -196,37 +197,31 @@ void transmit_id(String sendValue, uint32_t bitcount) {
 		sendValue = sendValue.substring(excess_bits >> 2); // / 4
 		excess_bits &= 3; //%= 4;
 		DEBUG("sending: " + sendValue + " with excess bits: " + excess_bits + "\n\t");
-	}
-	else if (bits_available < bitcount) {
+	} else if (bits_available < bitcount) {
 		for (uint32_t i = bitcount - bits_available; i > 0; i--) {
-			transmit_assert(D0_SENSE);
+			transmit_assert(PIN_D0);
 		}
 	}
 	for (uint32_t i = 0; i < sendValue.length(); i++) {
 		byte BYTE = char_to_byte(sendValue.charAt(i));
-		DEBUGF("i: %u  BYTE:0x%u\n", i , BYTE);
+		DEBUGF("i: %u  BYTE:0x%u\n", i, BYTE);
 		for (short x = 3 - excess_bits; x >= 0; x--) {
 			//DEBUGLN("x:" + String(x) + " b:" + b);
-			if (bitRead(BYTE, x)) {
-				transmit_assert(D1_SENSE);
-			}
-			else {
-				transmit_assert(D0_SENSE);
-			}
+			if (bitRead(BYTE, x)) transmit_assert(PIN_D1);
+			else transmit_assert(PIN_D0);
 		}
 		excess_bits = 0;
 	}
 }
 
-void append_log(const String & text) {
+void append_log(const String& text) {
 	File file = SPIFFS.open("/log.txt", "a");
 	if (file) {
 		String log(millis()); log += ' '; log += text;
 		file.println(log);
 		DEBUGLN("Appending to log: " + log);
 		file.close();
-	}
-	else DEBUGLN("Failed opening log file.");
+	} else DEBUGLN("Failed opening log file.");
 }
 
 void syslog(String text) {
@@ -268,9 +263,10 @@ void handleTxId() {
 	DEBUGLN("handleTxId: " + value);
 	const char* str = value.c_str();
 	char* colon = strchr(str, ':');
-	uint64_t sendValue = strtoull(str,&colon,16);
-	byte bitcount = strtoul(colon+1, NULL, 10);
-	transmit_id_nope(sendValue, bitcount);
+	uint64_t sendValue = strtoull(str, &colon, HEX);
+	byte bitcount = strtoul(colon + 1, &colon, 10);
+	uint32_t pulse_delta = strtoul(colon + 1, NULL, DEC);
+	transmit_id_nope(sendValue, bitcount, pulse_delta > INT16_MAX ? 2000 : pulse_delta);
 	server.send(200, F("text/plain"), "");
 }
 
@@ -302,9 +298,9 @@ bool loadConfig() {
 	//JsonObject& json = jsonBuffer.parseObject(buf.get());
 	DEBUG(F("Parse config file "));
 	if (json.hasError()) {
-		DEBUGF("failed, %s in %u\n",json.readError(), json.errorIndex());
-		return false;
-	}else DEBUGLN(F("done"));
+		DEBUGF("failed, %s in %u\n", json.readError(), json.errorIndex());
+		//return false;
+	} else DEBUGLN(F("done"));
 
 	// FIXME these should be testing for valid input before replacing defaults
 	if (json.has(SH("log_name"))) {
@@ -382,10 +378,7 @@ bool loadConfig() {
 //format bytes
 String formatBytes(size_t bytes) {
 	String ret;
-	if (bytes < 0x400) { ret = bytes; ret += 'B'; }
-	else if (bytes < 0x100000) { ret = (bytes / 1024.0f); ret += "KB"; }
-	else if (bytes < 0x40000000) { ret = bytes / 1048576.0f; ret += "MB"; }
-	else { ret = bytes / 1073741824.0f; ret += "GB"; }
+	if (bytes < 0x400) { ret = bytes; ret += 'B'; } else if (bytes < 0x100000) { ret = (bytes / 1024.0f); ret += "KB"; } else if (bytes < 0x40000000) { ret = bytes / 1048576.0f; ret += "MB"; } else { ret = bytes / 1073741824.0f; ret += "GB"; }
 	return ret;
 }
 
@@ -436,13 +429,11 @@ void handleFileUpload() {
 		DEBUGLN("handleFileUpload Name: " + filename);
 		fsUploadFile = SPIFFS.open(filename, "w");
 		//filename = String();
-	}
-	else if (upload.status == UPLOAD_FILE_WRITE) {
+	} else if (upload.status == UPLOAD_FILE_WRITE) {
 		DEBUGLN("handleFileUpload Data: " + upload.currentSize);
 		if (fsUploadFile)
 			fsUploadFile.write(upload.buf, upload.currentSize);
-	}
-	else if (upload.status == UPLOAD_FILE_END) {
+	} else if (upload.status == UPLOAD_FILE_END) {
 		if (fsUploadFile)
 			fsUploadFile.close();
 		DEBUGLN("handleFileUpload Size: " + upload.totalSize);
@@ -496,7 +487,7 @@ void handleFileList() {
 
 void handleDoS() {
 	if (basicAuthFailed()) return;
-	digitalWrite(D0_SENSE, HIGH);
+	digitalWrite(PIN_D0, HIGH);
 	server.send(200, F("text/plain"), "");
 	append_log(F("DoS mode set by API request."));
 }
@@ -514,8 +505,7 @@ void resetConfig(void) {
 	if (!digitalRead(CONF_RESET) && reset_pin_state) {
 		reset_pin_state = false;
 		config_reset_millis = millis();
-	}
-	else {
+	} else {
 		reset_pin_state = true;
 		if (millis() > (config_reset_millis + 2000)) {
 			append_log(F("Config reset by pin."));
@@ -523,48 +513,6 @@ void resetConfig(void) {
 			ESP.restart();
 		}
 	}
-}
-
-void auxChange(void) {
-	byte new_value = digitalRead(LED_SENSE);
-	if (new_value == expect_aux) {
-		last_aux = new_value;
-		expect_aux = 2;
-		return;
-	}
-	if (new_value != last_aux) {
-		if (millis() > aux_change) {
-			aux_change = millis() + 10;
-			last_aux = new_value;
-			append_log("Aux changed to " + String(new_value));
-		}
-	}
-}
-
-String grep_auth_file() {
-	char buffer[64];
-	char* this_id;
-	byte cnt = 0;
-
-	File file = SPIFFS.open(AUTH_FILE, "r");
-	if (!file) {
-		DEBUGLN(F("Failed to open auth file"));
-		return "";
-	}
-
-	while (file.available() > 0) {
-		char c = file.read();
-		buffer[cnt++] = c;
-		if ((c == '\n') || (cnt == sizeof(buffer) - 1)) {
-			buffer[cnt] = '\0';
-			cnt = 0;
-			this_id = strtok(buffer, " ");
-			if (reader_string == String(this_id)) {
-				return String(strtok(NULL, "\n"));
-			}
-		}
-	}
-	return "";
 }
 
 void server_init() {
@@ -604,7 +552,7 @@ void server_init() {
 #else
 			getChipModel()
 #endif
-			
+
 			, HEX) + "\"}\n";
 		server.send(200, "text/json", json);
 		});
@@ -624,3 +572,54 @@ void server_init() {
 	//MDNS.addService("http", "tcp", 80);
 	DEBUGLN(F("HTTP server started"));
 }
+
+String grep_auth_file() {
+	char buffer[64];
+	char* this_id;
+	byte cnt = 0;
+	File file = SPIFFS.open(AUTH_FILE, "r");
+	if (!file) {
+		DEBUGLN(F("Failed to open auth file"));
+		return "";
+	}
+
+	while (file.available() > 0) {
+		char c = file.read();
+		buffer[cnt++] = c;
+		if ((c == '\n') || (cnt == sizeof(buffer) - 1)) {
+			buffer[cnt] = '\0';
+			cnt = 0;
+			this_id = strtok(buffer, " ");
+			if (reader_string == String(this_id)) {
+				return String(strtok(NULL, "\n"));
+			}
+		}
+	}
+	return "";
+}
+/*
+void auxChange(void) {
+	byte new_value = digitalRead(PIN_LED);
+	if (new_value == expect_aux) {
+		last_aux = new_value;
+		expect_aux = 2;
+		return;
+	}
+	if (new_value != last_aux) {
+		if (millis() > aux_change) {
+			aux_change = millis() + 10;
+			last_aux = new_value;
+			append_log("Aux " + String(new_value));
+		}
+	}
+}
+
+byte toggle_pin(byte pin) {
+	byte new_value = !digitalRead(pin);
+	if (pin == LED_SENSE) expect_aux = !new_value;
+	digitalWrite(pin, new_value);
+	return new_value;
+}
+*/
+
+
