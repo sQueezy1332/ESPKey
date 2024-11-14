@@ -10,16 +10,16 @@ void setup() {
 	// Input interrupts
 	//attachInterrupt(digitalPinToInterrupt(PIN_D0), reader1_D0_trigger, FALLING);
 	//attachInterrupt(digitalPinToInterrupt(PIN_D1), reader1_D1_trigger, FALLING);
-	//attachInterrupt(digitalPinToInterrupt(PIN_LED), auxChange, CHANGE);
 	//attachInterrupt(digitalPinToInterrupt(CONF_RESET), resetConfig, CHANGE);
+	//attachInterrupt(digitalPinToInterrupt(PIN_LED), auxChange, CHANGE);
 #ifdef DEBUG_ENABLE
 	Serial.begin(115200);
 	delay(100);
 	Serial.setDebugOutput(true);
-	led_blink();
 	DEBUGLN("Chip ID: 0x" + String(ESP.getChipId(), HEX)); 
 	//while (true) { yield(); }
 #endif // DEBUG_ENABLE
+	led_blink();
 	// Set Hostname.
 	//String dhcp_hostname(HOSTNAME);
 	//dhcp_hostname += String(ESP.getChipId(), HEX);
