@@ -1,19 +1,12 @@
 #include "espkey.h"
 
 void setup() {
-	//// Outputs
-	//pinMode(D0_ASSERT, OUTPUT);
-	//digitalWrite(D0_ASSERT, LOW);
-	//pinMode(D1_ASSERT, OUTPUT);
-	//digitalWrite(D1_ASSERT, LOW);
-	//pinMode(LED_ASSERT, OUTPUT);
-	//digitalWrite(LED_ASSERT, LOW);
 	// Inputs
-	pinMode(D0_SENSE, OUTPUT_OPEN_DRAIN);
-	pinMode(D1_SENSE, OUTPUT_OPEN_DRAIN);
-	pinMode(LED_SENSE, OUTPUT_OPEN_DRAIN);
-	pinMode(CONF_RESET, INPUT_PULLUP);
-	pinMode(2, OUTPUT_OPEN_DRAIN); delay(5000);
+	pinMode(D0_SENSE, OUTPUT_OPEN_DRAIN); digitalWrite(D0_SENSE, HIGH);
+	pinMode(D1_SENSE, OUTPUT_OPEN_DRAIN); digitalWrite(D1_SENSE, HIGH);
+	pinMode(LED_SENSE, OUTPUT_OPEN_DRAIN); digitalWrite(LED_SENSE, HIGH);
+	pinMode(CONF_RESET, INPUT_PULLUP); 
+	//pinMode(2, OUTPUT); 
 	// Input interrupts
 	//attachInterrupt(digitalPinToInterrupt(D0_SENSE), reader1_D0_trigger, FALLING);
 	//attachInterrupt(digitalPinToInterrupt(D1_SENSE), reader1_D1_trigger, FALLING);
@@ -22,41 +15,52 @@ void setup() {
 #ifdef DEBUG_ENABLE
 	Serial.begin(115200);
 	delay(100);
-	//Serial.setDebugOutput(true);
+	Serial.setDebugOutput(true);
 	led_blink();
-	DEBUGLN("Chip ID: 0x" + String(ESP.getChipId(), HEX)); delay(2000);
-	digitalWrite(2, 0); 
-	while (true) {}
-
+	DEBUGLN("Chip ID: 0x" + String(ESP.getChipId(), HEX)); 
+	//while (true) { yield(); }
 #endif // DEBUG_ENABLE
 	// Set Hostname.
-	String dhcp_hostname(HOSTNAME);
-	dhcp_hostname += String(ESP.getChipId(), HEX);
-	WiFi.hostname(dhcp_hostname);
-
-	// Print hostname.
-	DEBUGLN("Hostname: " + dhcp_hostname);
+	//String dhcp_hostname(HOSTNAME);
+	//dhcp_hostname += String(ESP.getChipId(), HEX);
+	WiFi.hostname(HOSTNAME);
+	//DEBUGLN("Hostname: " + dhcp_hostname);
 
 	if (!SPIFFS.begin()) {
 		DEBUGLN(F("Failed to mount file system"));
-		return;
-	}
-	else {
-		Dir dir = SPIFFS.openDir("/");
-		while (dir.next()) {
-			String fileName = dir.fileName();
-			// This is a dirty hack to deal with readers which don't pull LED up to 5V
-			if (fileName == String("/auth.txt")) detachInterrupt(digitalPinToInterrupt(LED_SENSE));
+		//return;
+	} else {
+#ifdef ESP8266
+		Dir root = SPIFFS.openDir("/");
+#else
+		File root = SPIFFS.open("/");
+#endif
+		if (root.isDirectory()) {
+			String fileName;
+			size_t fileSize;
+#ifdef ESP8266
+			while (root.next()) {
+				fileName = root.fileName();
+				fileSize = root.fileSize();
+#else
+			for (File file = root.openNextFile(); file; file = root.openNextFile()) {
+				if (file.isDirectory()) continue;
+				fileName = file.name();
+				fileSize = file.fileSize();
 
-			size_t fileSize = dir.fileSize();
-			DEBUGF("FS File: %s, size: %s\n", fileName.c_str(), formatBytes(fileSize).c_str());
+#endif // ESP8266
+					// This is a dirty hack to deal with readers which don't pull LED up to 5V
+				if (fileName == "/auth.txt") detachInterrupt((digitalPinToInterrupt(LED_SENSE)));
+				DEBUGF("FS File: %s, size: %u bytes\n", fileName.c_str(), fileSize/*formatBytes(file.fileSize()).c_str()*/);
+
+			}
 		}
 	}
 	append_log(F("Starting up!"));
 
 	// If a log.txt exists, use ap_ssid=ESPKey-<chipid> instead of the default ESPKey-config
 	// A config file will take precedence over this
-	if (SPIFFS.exists("/log.txt")) dhcp_hostname.toCharArray(ap_ssid, sizeof(ap_ssid));
+	//if (SPIFFS.exists("/log.txt")) dhcp_hostname.toCharArray(ap_ssid, sizeof(ap_ssid));
 
 	// Load config file.
 	if (!loadConfig()) {
@@ -81,14 +85,11 @@ void setup() {
 
 		// ... Uncomment this for debugging output.
 		//WiFi.printDiag(Serial);
-	}
-	else {
+	} else {
 		// ... Begin with sdk config.
 		WiFi.begin();
 	}
-
 	DEBUGLN(F("Wait for WiFi connection."));
-
 	// ... Give ESP 10 seconds to connect to station.
 	uint32_t startTime = millis();
 	while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
@@ -103,30 +104,28 @@ void setup() {
 		// ... print IP Address
 		DEBUG("IP address: ");
 		DEBUGLN(WiFi.localIP());
+	} else if (ap_enable) {
+		DEBUGLN(F("Can not connect to WiFi station. Going into AP mode."));
+		// Go into software AP mode.
+		WiFi.mode(WIFI_AP);
+		WiFi.softAPConfig(ap_ip, ap_ip, IPAddress(255, 255, 255, 0));
+		WiFi.softAP(ap_ssid, ap_psk, 0, ap_hidden);
+
+		DEBUG(F("IP address: "));
+		DEBUGLN(WiFi.softAPIP());
+	} else {
+		DEBUGLN(F("Can not connect to WiFi station. Bummer."));
+		//WiFi.mode(WIFI_OFF);
 	}
-	else if (ap_enable) {
-			DEBUGLN(F("Can not connect to WiFi station. Going into AP mode."));
-
-			// Go into software AP mode.
-			WiFi.mode(WIFI_AP);
-			WiFi.softAPConfig(ap_ip, ap_ip, IPAddress(255, 255, 255, 0));
-			WiFi.softAP(ap_ssid, ap_psk, 0, ap_hidden);
-
-			DEBUG(F("IP address: "));
-			DEBUGLN(WiFi.softAPIP());
-		}
-		else {
-			DEBUGLN(F("Can not connect to WiFi station. Bummer."));
-			//WiFi.mode(WIFI_OFF);
-		}
-	// Start OTA server.
-	ArduinoOTA.setHostname(dhcp_hostname.c_str());
-	ArduinoOTA.setPassword(ota_password);
+// Start OTA server.
+	ArduinoOTA.setHostname(/*dhcp_hostname.c_str()*/ap_ssid.c_str());
+	ArduinoOTA.setPassword(ota_password.c_str());
 	ArduinoOTA.begin();
+#ifdef ESP8266
 	if (MDNS.begin(mDNShost)) {
 		DEBUGLN("Open http://" + String(mDNShost) + ".local/");
-	}
-	else { DEBUGLN("Error setting up MDNS responder!"); }
+	} else { DEBUGLN("Error setting up MDNS responder!"); }
+#endif
 	server_init();
 	syslog(String(log_name) + F(" starting up!"));
 }
@@ -140,8 +139,7 @@ void loop() {
 		if (name != "") {
 			if (toggle_pin(LED_SENSE)) {
 				name += " enabled " + String(log_name);
-			}
-			else {
+			} else {
 				name += " disabled " + String(log_name);
 			}
 			append_log(name);
@@ -154,11 +152,12 @@ void loop() {
 		else append_log(reader_string);
 		reader_reset();
 	}
-
 	// Check for HTTP requests
+//#ifdef ESP8266
 	server.handleClient();
+//#endif
 	ArduinoOTA.handle();
 	//gpio_set_level();
 	// Standard delay
-	delay(100);
+	//delay(100);
 }
