@@ -2,15 +2,15 @@
 
 void setup() {
 	// Inputs
-	pinMode(D0_SENSE, OUTPUT_OPEN_DRAIN); digitalWrite(D0_SENSE, HIGH);
-	pinMode(D1_SENSE, OUTPUT_OPEN_DRAIN); digitalWrite(D1_SENSE, HIGH);
-	pinMode(LED_SENSE, OUTPUT_OPEN_DRAIN); digitalWrite(LED_SENSE, HIGH);
+	pinMode(PIN_D0, OUTPUT_OPEN_DRAIN); digitalWrite(PIN_D0, HIGH);
+	pinMode(PIN_D1, OUTPUT_OPEN_DRAIN); digitalWrite(PIN_D1, HIGH);
+	pinMode(PIN_LED, OUTPUT_OPEN_DRAIN); digitalWrite(PIN_LED, HIGH);
 	pinMode(CONF_RESET, INPUT_PULLUP); 
-	//pinMode(2, OUTPUT); 
+	pinMode(2, OUTPUT); 
 	// Input interrupts
-	//attachInterrupt(digitalPinToInterrupt(D0_SENSE), reader1_D0_trigger, FALLING);
-	//attachInterrupt(digitalPinToInterrupt(D1_SENSE), reader1_D1_trigger, FALLING);
-	//attachInterrupt(digitalPinToInterrupt(LED_SENSE), auxChange, CHANGE);
+	//attachInterrupt(digitalPinToInterrupt(PIN_D0), reader1_D0_trigger, FALLING);
+	//attachInterrupt(digitalPinToInterrupt(PIN_D1), reader1_D1_trigger, FALLING);
+	//attachInterrupt(digitalPinToInterrupt(PIN_LED), auxChange, CHANGE);
 	//attachInterrupt(digitalPinToInterrupt(CONF_RESET), resetConfig, CHANGE);
 #ifdef DEBUG_ENABLE
 	Serial.begin(115200);
@@ -50,7 +50,7 @@ void setup() {
 
 #endif // ESP8266
 					// This is a dirty hack to deal with readers which don't pull LED up to 5V
-				if (fileName == "/auth.txt") detachInterrupt((digitalPinToInterrupt(LED_SENSE)));
+				if (fileName == "/auth.txt") detachInterrupt((digitalPinToInterrupt(PIN_LED)));
 				DEBUGF("FS File: %s, size: %u bytes\n", fileName.c_str(), fileSize/*formatBytes(file.fileSize()).c_str()*/);
 
 			}
@@ -73,22 +73,16 @@ void setup() {
 		WiFi.mode(WIFI_STA);
 		delay(10);
 	}
-
+#ifdef DEBUG_ENABLE
+	WiFi.printDiag(Serial);
+#endif
 	// ... Compare file config with sdk config.
 	if (WiFi.SSID() != station_ssid || WiFi.psk() != station_psk) {
 		DEBUGLN(F("WiFi config changed.  Attempting new connection"));
-
-		// ... Try to connect as WiFi station.
-		WiFi.begin(station_ssid, station_psk);
-
+		WiFi.begin(station_ssid, station_psk);// ... Try to connect as WiFi station.
 		DEBUGLN("new SSID: " + String(WiFi.SSID()));
+	} else WiFi.begin();// ... Begin with sdk config.
 
-		// ... Uncomment this for debugging output.
-		//WiFi.printDiag(Serial);
-	} else {
-		// ... Begin with sdk config.
-		WiFi.begin();
-	}
 	DEBUGLN(F("Wait for WiFi connection."));
 	// ... Give ESP 10 seconds to connect to station.
 	uint32_t startTime = millis();
@@ -98,7 +92,6 @@ void setup() {
 		delay(500);
 	}
 	DEBUGLN();
-
 	// Check connection
 	if (WiFi.status() == WL_CONNECTED) {
 		// ... print IP Address
@@ -132,12 +125,13 @@ void setup() {
 
 void loop() {
 	// Check for card reader data
-	if (reader_count && (millis() > reader1_millis + 5 /*|| millis() < 10*/)) {
+	if (reader_count > CARD_LEN && (uS - reader_last > 5000 /*|| millis() < 10*/)) {
 		//fix_reader_string();
-		reader_string = String(reader_code, HEX); reader_string += ':' + String(reader_count);
-		String name(grep_auth_file());
+		noInterrupts();
+		reader_string = String(reader_code, HEX); reader_string += ':' + reader_string += reader_count;
+		/*String name(grep_auth_file());
 		if (name != "") {
-			if (toggle_pin(LED_SENSE)) {
+			if (toggle_pin(PIN_LED)) {
 				name += " enabled " + String(log_name);
 			} else {
 				name += " disabled " + String(log_name);
@@ -146,10 +140,16 @@ void loop() {
 			syslog(name);
 		}
 		//else if (reader_string == DoS_id) {
-		//	digitalWrite(D0_SENSE, HIGH);
+		//	digitalWrite(PIN_D0, HIGH);
 		//	append_log("DoS mode enabled by control card");
 		//}
-		else append_log(reader_string);
+		else */ 
+		{
+			reader_string += '_';
+			reader_string += reader_delta / (reader_count - 1);
+			interrupts();
+			append_log(reader_string);
+		}
 		reader_reset();
 	}
 	// Check for HTTP requests
