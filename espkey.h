@@ -11,7 +11,6 @@
 * excellent reference: https://github.com/brad-anton/VertX
 *
 */
-
 #include <WiFiUdp.h>
 WiFiUDP Udp;
 #ifdef ESP8266
@@ -34,6 +33,7 @@ HTTPUpdateServer httpUpdater;
 #include <ArduinoOTA.h>
 #include <GSON.h>
 #include <StringUtils.h>
+#include <GyverIO.h>
 
 #define VERSION "131"
 #define HOSTNAME "ESPKey" // Hostname prefix for DHCP/OTA
@@ -51,13 +51,10 @@ HTTPUpdateServer httpUpdater;
 //#define LED_ASSERT 4
 #define PIN_LED 2
 #define LED 2
-#define CONF_RESET 0
+#define PIN_CONF_RESET 0
 
-#if defined ESP32
-#define gWrite(pin, x) gpio_set_level(pin,x)
-#elif defined ESP8266 
-#define	gWrite(pin, x) gpio_set_level(pin, x)
-#endif
+#define dWrite(pin, x) gio::write(pin, x)
+
 #define DEBUG_ENABLE
 #ifdef DEBUG_ENABLE
 #define DEBUG(x) Serial.print(x)
