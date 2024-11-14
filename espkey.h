@@ -218,11 +218,12 @@ void transmit_id(String sendValue, uint32_t bitcount) {
 	}
 }
 
-void append_log(String text) {
+void append_log(const String & text) {
 	File file = SPIFFS.open("/log.txt", "a");
 	if (file) {
-		file.println(String(millis()) + ' ' + text);
-		DEBUGLN("Appending to log: " + String(millis()) + ' ' + text);
+		String log(millis()); log += ' '; log += text;
+		file.println(log);
+		DEBUGLN("Appending to log: " + log);
 		file.close();
 	}
 	else DEBUGLN("Failed opening log file.");
@@ -299,11 +300,11 @@ bool loadConfig() {
 	json.hashKeys();
 	//StaticJsonBuffer<1024> jsonBuffer;
 	//JsonObject& json = jsonBuffer.parseObject(buf.get());
-	//DEBUG(F("Parse config file "));
-	//if (json.hasError()) {
-	//	DEBUGF("failed, %s in %u\n",json.readError(), json.errorIndex());
-	//	return false;
-	//}else DEBUGLN(F("done"));
+	DEBUG(F("Parse config file "));
+	if (json.hasError()) {
+		DEBUGF("failed, %s in %u\n",json.readError(), json.errorIndex());
+		return false;
+	}else DEBUGLN(F("done"));
 
 	// FIXME these should be testing for valid input before replacing defaults
 	if (json.has(SH("log_name"))) {
