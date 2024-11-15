@@ -11,6 +11,7 @@
 * excellent reference: https://github.com/brad-anton/VertX
 *
 */
+
 #include <WiFiUdp.h>
 WiFiUDP Udp;
 #ifdef ESP8266
@@ -34,26 +35,26 @@ HTTPUpdateServer httpUpdater;
 #include <GSON.h>
 #include <StringUtils.h>
 #include <GyverIO.h>
+#include <OneWireSlave.h>
 
 #define VERSION "131"
 #define HOSTNAME "ESPKey" // Hostname prefix for DHCP/OTA
 #define CONFIG_FILE "/config.json"
 #define AUTH_FILE "/auth.txt"
 #define CARD_LEN 4     // minimum card length in bits
-#define PULSE_WIDTH 200 // length of asserted pulse in microSeconds
+#define PULSE_WIDTH 100 // length of asserted pulse in microSeconds
 #define PULSE_DELTA 2000   // delay between pulses in microSeconds
 
 // Pin number assignments
-//#define D0_ASSERT 12
 #define PIN_D0 4
-//#define D1_ASSERT 16
 #define PIN_D1 5
-//#define LED_ASSERT 4
 #define PIN_LED 2
-#define LED 2
+#define PIN_MODE 16
 #define PIN_CONF_RESET 0
+#define LED 2
 
 #define dWrite(pin, x) gio::write(pin, x)
+#define dRead(pin) gio::read(pin)
 
 #define DEBUG_ENABLE
 #ifdef DEBUG_ENABLE
@@ -83,10 +84,10 @@ HTTPUpdateServer httpUpdater;
 String log_name("Alpha");
 String ap_ssid(HOSTNAME); // Default SSID.
 IPAddress ap_ip(192, 168, 4, 1);
-String ap_psk("accessgranted"); // Default PSK.
+String ap_psk("defaultpass"); // Default PSK.
 String station_ssid;
 String station_psk;
-String mDNShost("ESPKey");
+String mDNShost("espkey");
 String DoS_id("1ffffff:26");
 String ota_password("ExtraSpecialPassKey");
 String www_username;
@@ -99,26 +100,24 @@ bool ap_enable = true;
 bool ap_hidden = false;
 byte syslog_priority = 36;
 
-unsigned long config_reset_millis = 30000;
+const byte pin_onewireslave = PIN_D0;
+volatile bool presence_flag = false;
+bool onewire_mode = false;
+OneWireSniffer slave;
 
 String reader_string;
 volatile uint64_t reader_code = 0;
+volatile byte reader_count = 0;
 volatile uint64_t reader_last = 0;
 volatile uint32_t reader_delta = 0;
-volatile byte reader_count = 0;
+
+
+
 /*
 volatile byte last_aux = 1;
 volatile byte expect_aux = 2;
 volatile uint32_t aux_change = 0;
 */
-void led_blink(byte count = LED_BLINK_COUNT, byte led_delay = LED_DELAY) {
-	while (count--) {
-		digitalWrite(LED, LED_ON);
-		delay(led_delay);
-		digitalWrite(LED, LED_OFF);
-		delay(led_delay);
-	}
-}
 void IRAM_ATTR reader1_D0_trigger(void) {
 	uint64_t time = uS;
 	if(reader_last) reader_delta += time - reader_last;
@@ -130,6 +129,27 @@ void IRAM_ATTR reader1_D0_trigger(void) {
 void IRAM_ATTR reader1_D1_trigger(void) {
 	reader1_D0_trigger();
 	reader_code |= 1;
+}
+
+void IRAM_ATTR onewire_presence() {
+	uint64_t time = uS;
+	uint32_t delta = time - reader_last;
+	if (delta < 480 + 80 && delta > 480) {
+		presence_flag = true;
+		detachInterrupt(digitalPinToInterrupt(PIN_D0));
+		return;
+	} reader_last = time;
+}
+
+bool onewire_handle() {
+	byte cmd;
+	presence_flag = false;
+	if (!slave.recvAndProcessCmd((byte*)&reader_code, cmd)) goto _exit;
+	delay(100);
+	reader_count = cmd;
+_exit:
+	attachInterrupt(digitalPinToInterrupt(PIN_D0), onewire_presence, FALLING);
+	return slave.error == slave.ONEWIRE_NO_ERROR;
 }
 
 byte char_to_byte(char in) {
@@ -172,17 +192,22 @@ void reader_reset() {
 }
 
 void transmit_assert(bool bit, const uint16_t pulse_delta = PULSE_DELTA) {
-	bit ? digitalWrite(PIN_D1, LOW) : digitalWrite(PIN_D0, LOW);
+	bit ? dWrite(PIN_D1, LOW) : dWrite(PIN_D0, LOW);
 	delayMicroseconds(PULSE_WIDTH);
-	bit ? digitalWrite(PIN_D1, HIGH) : digitalWrite(PIN_D0, HIGH);
+	bit ? dWrite(PIN_D1, HIGH) : dWrite(PIN_D0, HIGH);
 	delayMicroseconds(pulse_delta - PULSE_WIDTH);
 }
 
 void transmit_id_nope(uint64_t sendValue, byte bitcount, uint16_t pulse_delta = PULSE_DELTA) {
 	DEBUGLN("[-] Sending Data: " + String(sendValue, HEX) + ':' + String(bitcount) + '\n');
+	yield();
+	noInterrupts();
 	for (uint64_t bitmask = 1 << (bitcount - 1); bitmask; bitmask >>= 1) {
 		transmit_assert(sendValue & bitmask, pulse_delta);
 	}
+	interrupts();
+	yield();
+
 }
 
 void transmit_id(String sendValue, uint32_t bitcount) {
@@ -223,11 +248,10 @@ void append_log(const String& text) {
 
 void syslog(String text) {
 	if (WiFi.status() != WL_CONNECTED || syslog_server == INADDR_NONE) return;
-	char buf[101];
-	text = '<' + String(syslog_priority) + '>' + String(syslog_host) + ' ' + String(syslog_service_name) + ": " + text;
-	text.toCharArray(buf, sizeof(buf) - 1);
+	String log('<');
+	log += syslog_priority; log += '>'; log += syslog_host; log += ' '; log += syslog_service_name; log += ": "; log += text;
 	Udp.beginPacket(syslog_server, syslog_port);
-	Udp.write((uint8_t*)buf, sizeof(buf));
+	Udp.write(log.c_str(), log.length());
 	Udp.endPacket();
 }
 
@@ -260,11 +284,27 @@ void handleTxId() {
 	DEBUGLN("handleTxId: " + value);
 	const char* str = value.c_str();
 	char* colon = strchr(str, ':');
-	uint64_t sendValue = strtoull(str, &colon, HEX);
-	byte bitcount = strtoul(colon + 1, &colon, 10);
-	uint32_t pulse_delta = strtoul(colon + 1, NULL, DEC);
-	transmit_id_nope(sendValue, bitcount, pulse_delta > INT16_MAX ? 2000 : pulse_delta);
-	server.send(200, F("text/plain"), "");
+	uint64_t sendValue = strtoull(str, &colon, HEX); DEBUGF("sendValue %X\n", sendValue);
+	String content;
+	if (onewire_mode) {
+		slave.init((byte*)&sendValue);
+		uint32_t timestamp = millis() + 1000;
+		for (byte i = 0; i < 23; i++) {
+			while (millis() < timestamp) {
+				if (!slave.OneWireSlave::waitReset(2) && slave.error != slave.ONEWIRE_WAIT_RESET_TIMEOUT) continue;
+				if (!slave.OneWireSlave::presence()) continue;
+				if (!slave.OneWireSlave::recvAndProcessCmd()) continue;
+				break;
+			}
+		}
+		content = String(slave.error);
+	}
+	else { 
+		byte bitcount = strtoul(colon + 1, &colon, 10);	DEBUGF("bitcount %u\n", bitcount);
+		uint32_t pulse_delta = strtoul(colon + 1, NULL, DEC); DEBUGF("pulse_delta %u\n", pulse_delta);
+		transmit_id_nope(sendValue, bitcount, pulse_delta > INT16_MAX ? 2000 : pulse_delta); 
+	}
+	server.send(200, F("text/plain"), content);
 }
 
 bool loadConfig() {
@@ -484,7 +524,7 @@ void handleFileList() {
 
 void handleDoS() {
 	if (basicAuthFailed()) return;
-	digitalWrite(PIN_D0, HIGH);
+	dWrite(PIN_D0, LOW);
 	server.send(200, F("text/plain"), "");
 	append_log(F("DoS mode set by API request."));
 }
@@ -496,15 +536,16 @@ void handleRestart() {
 	ESP.restart();
 }
 
-void resetConfig(void) {
+void IRAM_ATTR resetConfig(void) {
 	static bool reset_pin_state = true;
+	unsigned long config_reset_millis = 30000;
 	if (millis() > 30000) return;
-	if (!digitalRead(CONF_RESET) && reset_pin_state) {
+	if (!digitalRead(PIN_CONF_RESET) && reset_pin_state) {
 		reset_pin_state = false;
 		config_reset_millis = millis();
 	} else {
 		reset_pin_state = true;
-		if (millis() > (config_reset_millis + 2000)) {
+		if (millis() - config_reset_millis > 2000) {
 			append_log(F("Config reset by pin."));
 			SPIFFS.remove(CONFIG_FILE);
 			ESP.restart();
@@ -570,6 +611,34 @@ void server_init() {
 	DEBUGLN(F("HTTP server started"));
 }
 
+bool wifi_sta_init() {
+	WiFi.mode(WIFI_STA);
+#ifdef DEBUG_ENABLE
+	WiFi.printDiag(Serial);
+#endif
+	// ... Compare file config with sdk config.
+	if (WiFi.SSID() != station_ssid || WiFi.psk() != station_psk) {
+		DEBUGLN(F("WiFi config changed.  Attempting new connection"));
+		WiFi.begin(station_ssid, station_psk);// ... Try to connect as WiFi station.
+		DEBUGLN("new SSID: " + String(WiFi.SSID()));
+	} else WiFi.begin();// ... Begin with sdk config.
+
+	DEBUGLN(F("Wait for WiFi connection."));
+	// ... Give ESP 10 seconds to connect to station.
+	uint32_t startTime = millis();
+	while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
+		DEBUG(". ");
+		//DEBUG(WiFi.status());
+		delay(500);
+	}
+	DEBUGLN();
+	// Check connection
+	if (WiFi.status() == WL_CONNECTED) {
+		DEBUG("IP address: "); DEBUGLN(WiFi.localIP());
+		return true;
+	} 
+	return false;
+}
 String grep_auth_file() {
 	char buffer[64];
 	char* this_id;
@@ -594,6 +663,15 @@ String grep_auth_file() {
 	}
 	return "";
 }
+
+void led_blink(byte count = LED_BLINK_COUNT, byte led_delay = LED_DELAY) {
+	while (count--) {
+		dWrite(LED, LED_ON);
+		delay(led_delay);
+		dWrite(LED, LED_OFF);
+		delay(led_delay);
+	}
+}
 /*
 void auxChange(void) {
 	byte new_value = digitalRead(PIN_LED);
@@ -613,8 +691,8 @@ void auxChange(void) {
 
 byte toggle_pin(byte pin) {
 	byte new_value = !digitalRead(pin);
-	if (pin == LED_SENSE) expect_aux = !new_value;
-	digitalWrite(pin, new_value);
+	if (pin == PIN_LED) expect_aux = !new_value;
+	dWrite(pin, new_value);
 	return new_value;
 }
 */
