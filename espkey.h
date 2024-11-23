@@ -50,7 +50,7 @@ HTTPUpdateServer httpUpdater;
 #define PIN_D1 5
 #define PIN_LED 2
 #define PIN_MODE 16
-#define PIN_CONF_RESET 0
+#define PIN_CONF_RESET 14
 #define LED 2
 
 #define dWrite(pin, x) gio::write(pin, x)
@@ -93,25 +93,27 @@ String ota_password("ExtraSpecialPassKey");
 String www_username;
 String www_password;
 String syslog_service_name("accesscontrol");
-String syslog_host("ESPKey");
+String syslog_host(HOSTNAME);
 IPAddress syslog_server(0, 0, 0, 0);
-unsigned int syslog_port = 514;
+uint16_t syslog_port = 514;
 bool ap_enable = true;
 bool ap_hidden = false;
 byte syslog_priority = 36;
 
-const byte pin_onewireslave = PIN_D0;
+const byte pin_onewire = PIN_D0;
 volatile bool presence_flag = false;
-bool onewire_mode = false;
+byte onewire_mode = 0;
 OneWireSniffer slave;
 
 String reader_string;
 volatile uint64_t reader_code = 0;
 volatile byte reader_count = 0;
+#ifdef ESP8266
+volatile uint32_t reader_last = 0;
+#else
 volatile uint64_t reader_last = 0;
+#endif // ESP8266
 volatile uint32_t reader_delta = 0;
-
-
 
 /*
 volatile byte last_aux = 1;
@@ -119,8 +121,8 @@ volatile byte expect_aux = 2;
 volatile uint32_t aux_change = 0;
 */
 void IRAM_ATTR reader1_D0_trigger(void) {
-	uint64_t time = uS;
-	if(reader_last) reader_delta += time - reader_last;
+	auto time = uS;
+	if (reader_last) reader_delta += time - reader_last;
 	reader_last = time;
 	reader_count++;
 	reader_code <<= 1;
@@ -132,23 +134,29 @@ void IRAM_ATTR reader1_D1_trigger(void) {
 }
 
 void IRAM_ATTR onewire_presence() {
-	uint64_t time = uS;
+	auto time = uS;
 	uint32_t delta = time - reader_last;
-	if (delta < 480 + 80 && delta > 480) {
+	if (onewire_mode == RISING) { goto  _presence; }
+	if (delta < (480 + 80) && delta > 480) {
+_presence:
 		presence_flag = true;
-		detachInterrupt(digitalPinToInterrupt(PIN_D0));
-		return;
+		ETS_GPIO_INTR_DISABLE();
 	} reader_last = time;
 }
 
 bool onewire_handle() {
 	byte cmd;
 	presence_flag = false;
+	if (onewire_mode == RISING) { 
+		if (!dRead(pin_onewire)) {
+			if(!slave.waitReset(1) || !slave.presenceDetection()) goto _exit;
+		}
+	};
 	if (!slave.recvAndProcessCmd((byte*)&reader_code, cmd)) goto _exit;
-	delay(100);
 	reader_count = cmd;
+	delay(5);
 _exit:
-	attachInterrupt(digitalPinToInterrupt(PIN_D0), onewire_presence, FALLING);
+	ETS_GPIO_INTR_ENABLE();
 	return slave.error == slave.ONEWIRE_NO_ERROR;
 }
 
@@ -164,23 +172,32 @@ char c2h(byte c) {
 	return "0123456789ABCDEF"[0xF & c];
 }
 
-void fix_reader_string() {
-	byte loose_bits = reader_count & 3; //%4
-	if (loose_bits) {
-		byte moving_bits = 4 - loose_bits;
-		byte moving_mask = (1 << moving_bits) - 1;
-		DEBUGLN("lb: " + String(loose_bits) + " mb: " + String(moving_bits) + " mm: " + String(moving_mask, HEX));
-		byte BYTE = char_to_byte(reader_string[0]);
-		uint32_t str_len = reader_string.length();
-		for (uint32_t i = 0; i < str_len; i++) {
-			reader_string[i] = c2h(BYTE >> moving_bits);
-			BYTE &= moving_mask;
-			BYTE = (BYTE << 4) | char_to_byte(reader_string.charAt(i + 1));
-			DEBUGLN("BYTE: " + String(BYTE, HEX) + " i: " + String(reader_string.charAt(i)));
+void led_detach() {
+#ifdef ESP8266
+	Dir root = SPIFFS.openDir("/");
+#else
+	File root = SPIFFS.open("/");
+#endif
+	if (root.isDirectory()) {
+		String fileName;
+		size_t fileSize;
+#ifdef ESP8266
+		while (root.next()) {
+			fileName = root.fileName();
+			fileSize = root.fileSize();
+#else
+		for (File file = root.openNextFile(); file; file = root.openNextFile()) {
+			if (file.isDirectory()) continue;
+			fileName = file.name();
+			fileSize = file.fileSize();
+
+#endif // ESP8266
+					// This is a dirty hack to deal with readers which don't pull LED up to 5V
+			if (fileName == "/auth.txt") detachInterrupt((digitalPinToInterrupt(PIN_LED)));
+			DEBUGF("FS File: %s, size: %u bytes\n", fileName.c_str(), fileSize/*formatBytes(file.fileSize()).c_str()*/);
+
 		}
-		reader_string += String((BYTE >> moving_bits) | reader_code, HEX);
 	}
-	reader_string += ':' + String(reader_count);
 }
 
 void reader_reset() {
@@ -191,7 +208,7 @@ void reader_reset() {
 	//reader_string = "";
 }
 
-void transmit_assert(bool bit, const uint16_t pulse_delta = PULSE_DELTA) {
+void transmit_assert(bool bit, uint16_t pulse_delta = PULSE_DELTA) {
 	bit ? dWrite(PIN_D1, LOW) : dWrite(PIN_D0, LOW);
 	delayMicroseconds(PULSE_WIDTH);
 	bit ? dWrite(PIN_D1, HIGH) : dWrite(PIN_D0, HIGH);
@@ -236,10 +253,10 @@ void transmit_id(String sendValue, uint32_t bitcount) {
 	}
 }
 
-void append_log(const String& text) {
+void append_log(const String & text) {
 	File file = SPIFFS.open("/log.txt", "a");
 	if (file) {
-		String log(millis()); log += ' '; log += text;
+		String log(systimer / 1000); log += ' '; log += text;
 		file.println(log);
 		DEBUGLN("Appending to log: " + log);
 		file.close();
@@ -253,6 +270,23 @@ void syslog(String text) {
 	Udp.beginPacket(syslog_server, syslog_port);
 	Udp.write(log.c_str(), log.length());
 	Udp.endPacket();
+}
+
+void IRAM_ATTR resetConfig(void) {
+	static bool reset_pin_state = true;
+	auto config_reset_millis = uS;
+	if (millis() > 30000) return;
+	if (!digitalRead(PIN_CONF_RESET) && reset_pin_state) {
+		reset_pin_state = false;
+		config_reset_millis = millis();
+	} else {
+		reset_pin_state = true;
+		if (millis() - config_reset_millis > 2000) {
+			append_log(F("Config reset by pin."));
+			SPIFFS.remove(CONFIG_FILE);
+			ESP.restart();
+		}
+	}
 }
 
 bool basicAuthFailed() {
@@ -285,26 +319,26 @@ void handleTxId() {
 	const char* str = value.c_str();
 	char* colon = strchr(str, ':');
 	uint64_t sendValue = strtoull(str, &colon, HEX); DEBUGF("sendValue %X\n", sendValue);
-	String content;
+	String result;
 	if (onewire_mode) {
-		slave.init((byte*)&sendValue);
-		uint32_t timestamp = millis() + 1000;
+		OneWireSlave emul;
+		emul.init((byte*)&sendValue);
+		auto timestamp = uS + 1000000;
 		for (byte i = 0; i < 23; i++) {
-			while (millis() < timestamp) {
-				if (!slave.OneWireSlave::waitReset(2) && slave.error != slave.ONEWIRE_WAIT_RESET_TIMEOUT) continue;
-				if (!slave.OneWireSlave::presence()) continue;
-				if (!slave.OneWireSlave::recvAndProcessCmd()) continue;
+			while (uS < timestamp) {
+				if (!emul.waitReset(1) && emul.error != emul.ONEWIRE_WAIT_RESET_TIMEOUT) continue;
+				if (!emul.presence()) continue;
+				if (!emul.recvAndProcessCmd()) continue;
 				break;
 			}
 		}
-		content = String(slave.error);
-	}
-	else { 
+		result = String(emul.error);
+	} else {
 		byte bitcount = strtoul(colon + 1, &colon, 10);	DEBUGF("bitcount %u\n", bitcount);
 		uint32_t pulse_delta = strtoul(colon + 1, NULL, DEC); DEBUGF("pulse_delta %u\n", pulse_delta);
-		transmit_id_nope(sendValue, bitcount, pulse_delta > INT16_MAX ? 2000 : pulse_delta); 
+		transmit_id_nope(sendValue, bitcount, pulse_delta > INT16_MAX ? 2000 : pulse_delta);
 	}
-	server.send(200, F("text/plain"), content);
+	server.send(200, F("text/plain"), result);
 }
 
 bool loadConfig() {
@@ -317,7 +351,7 @@ bool loadConfig() {
 
 	size_t size = configFile.size();
 	DEBUGF("File size %lu\n", size);
-	if (size > 1024) {
+	if (size > 0x400) {
 		DEBUGLN(F("Config file size is too large"));
 		return false;
 	}
@@ -410,13 +444,6 @@ bool loadConfig() {
 	}
 
 	return true;
-}
-
-//format bytes
-String formatBytes(size_t bytes) {
-	String ret;
-	if (bytes < 0x400) { ret = bytes; ret += 'B'; } else if (bytes < 0x100000) { ret = (bytes / 1024.0f); ret += "KB"; } else if (bytes < 0x40000000) { ret = bytes / 1048576.0f; ret += "MB"; } else { ret = bytes / 1073741824.0f; ret += "GB"; }
-	return ret;
 }
 
 String getContentType(String& filename) {
@@ -520,7 +547,7 @@ void handleFileList() {
 	}
 	output += "]";
 	server.send(200, "text/json", output);
-}
+	}
 
 void handleDoS() {
 	if (basicAuthFailed()) return;
@@ -534,23 +561,6 @@ void handleRestart() {
 	append_log(F("Restart requested by user."));
 	server.send(200, "text/plain", "OK");
 	ESP.restart();
-}
-
-void IRAM_ATTR resetConfig(void) {
-	static bool reset_pin_state = true;
-	unsigned long config_reset_millis = 30000;
-	if (millis() > 30000) return;
-	if (!digitalRead(PIN_CONF_RESET) && reset_pin_state) {
-		reset_pin_state = false;
-		config_reset_millis = millis();
-	} else {
-		reset_pin_state = true;
-		if (millis() - config_reset_millis > 2000) {
-			append_log(F("Config reset by pin."));
-			SPIFFS.remove(CONFIG_FILE);
-			ESP.restart();
-		}
-	}
 }
 
 void server_init() {
@@ -576,7 +586,7 @@ void server_init() {
 	server.on("/edit", HTTP_POST, []() { server.send(200, "text/plain", ""); }, handleFileUpload);
 	server.on("/restart", HTTP_GET, handleRestart);
 	//called when the url is not defined here
-	//use it to load content from SPIFFS
+	//use it to load result from SPIFFS
 	server.onNotFound([]() {
 		if (basicAuthFailed()) return;
 		if (!handleFileRead(server.uri()))
@@ -597,21 +607,21 @@ void server_init() {
 	//get heap status, analog input value and all GPIO statuses in one json call
 	server.on("/all", HTTP_GET, []() {
 		if (basicAuthFailed()) return;
-		//String json = "{";
-		//json += "\"heap\":" + String(ESP.getFreeHeap());
-		//json += ", \"analog\":" + String(analogRead(A0));
-		//json += ", \"gpio\":" + String((uint32_t)(((GPI | GPO) & 0xFFFF) | ((GP16I & 0x01) << 16)));
-		//json += "}";
-		//server.send(200, "text/json", json);
+		String json = "{";
+		json += "\"heap\":" + String(ESP.getFreeHeap());
+		json += ", \"analog\":" + String(analogRead(A0));
+		json += ", \"gpio\":" + String((uint32_t)(((GPI | GPO) & 0xFFFF) | ((GP16I & 0x01) << 16)));
+		json += "}";
+		server.send(200, "text/json", json);
 		});
 	server.serveStatic("/static", SPIFFS, "/static", "max-age=86400");
 	httpUpdater.setup(&server);	// This doesn't do authentication
 	server.begin();
-	//MDNS.addService("http", "tcp", 80);
+	MDNS.addService("http", "tcp", 80);
 	DEBUGLN(F("HTTP server started"));
 }
 
-bool wifi_sta_init() {
+bool wifi_sta_init(bool wait = false) {
 	WiFi.mode(WIFI_STA);
 #ifdef DEBUG_ENABLE
 	WiFi.printDiag(Serial);
@@ -625,20 +635,46 @@ bool wifi_sta_init() {
 
 	DEBUGLN(F("Wait for WiFi connection."));
 	// ... Give ESP 10 seconds to connect to station.
-	uint32_t startTime = millis();
-	while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
-		DEBUG(". ");
-		//DEBUG(WiFi.status());
-		delay(500);
+	if (wait) {
+		for (auto timestamp = millis() + 10000; WiFi.status() != WL_CONNECTED && millis() < timestamp;) {
+			DEBUG(". ");//DEBUG(WiFi.status());
+			delay(500);
+		} DEBUGLN();
 	}
-	DEBUGLN();
 	// Check connection
 	if (WiFi.status() == WL_CONNECTED) {
 		DEBUG("IP address: "); DEBUGLN(WiFi.localIP());
 		return true;
-	} 
+	}
 	return false;
 }
+
+//format bytes
+String formatBytes(size_t bytes) {
+	String ret;
+	if (bytes < 0x400) { ret = bytes; ret += 'B'; } else if (bytes < 0x100000) { ret = (bytes / 1024.0f); ret += "KB"; } else if (bytes < 0x40000000) { ret = bytes / 1048576.0f; ret += "MB"; } else { ret = bytes / 1073741824.0f; ret += "GB"; }
+	return ret;
+}
+
+void fix_reader_string() {
+	byte loose_bits = reader_count & 3; //%4
+	if (loose_bits) {
+		byte moving_bits = 4 - loose_bits;
+		byte moving_mask = (1 << moving_bits) - 1;
+		DEBUGLN("lb: " + String(loose_bits) + " mb: " + String(moving_bits) + " mm: " + String(moving_mask, HEX));
+		byte BYTE = char_to_byte(reader_string[0]);
+		uint32_t str_len = reader_string.length();
+		for (uint32_t i = 0; i < str_len; i++) {
+			reader_string[i] = c2h(BYTE >> moving_bits);
+			BYTE &= moving_mask;
+			BYTE = (BYTE << 4) | char_to_byte(reader_string.charAt(i + 1));
+			DEBUGLN("BYTE: " + String(BYTE, HEX) + " i: " + String(reader_string.charAt(i)));
+		}
+		reader_string += String((BYTE >> moving_bits) | reader_code, HEX);
+	}
+	reader_string += ':' + String(reader_count);
+}
+
 String grep_auth_file() {
 	char buffer[64];
 	char* this_id;
