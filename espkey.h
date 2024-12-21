@@ -108,11 +108,7 @@ OneWireSniffer slave;
 String reader_string;
 volatile uint64_t reader_code = 0;
 volatile byte reader_count = 0;
-#ifdef ESP8266
-volatile uint32_t reader_last = 0;
-#else
-volatile uint64_t reader_last = 0;
-#endif // ESP8266
+volatile decltype(uS) reader_last = 0;
 volatile uint32_t reader_delta = 0;
 
 /*
