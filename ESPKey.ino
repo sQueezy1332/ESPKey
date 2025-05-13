@@ -72,13 +72,13 @@ void setup() {
 void loop() {
 	// Check for card reader data
 	if (onewire_mode && presence_flag) {
-		if (!onewire_handle()) {
-			reader_reset();
-			return;
-		};
+		if (onewire_handler()) goto _write;
+		reader_reset();
+		return;
 	}
 	if (reader_count > CARD_LEN && (uS - reader_last > 5000 /*|| millis() < 10*/)) {
 		//fix_reader_string();
+	write:
 		noInterrupts();
 		reader_string = String(reader_code, HEX); reader_string += ':' + reader_string += reader_count;
 		/*String name(grep_auth_file());
