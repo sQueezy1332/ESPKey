@@ -132,25 +132,22 @@ void IRAM_ATTR reader1_D1_trigger(void) {
 void IRAM_ATTR onewire_presence() {
 	auto time = uS;
 	uint32_t delta = time - reader_last;
-	if (onewire_mode == RISING) { goto  _presence; }
-	if (delta < (480 + 80) && delta > 480) {
-_presence:
-		presence_flag = true;
-		ETS_GPIO_INTR_DISABLE();
-	} reader_last = time;
+	reader_last = time;
+	if (onewire_mode == FALLING)  //have resets
+		if (delta > (480 + 80) || delta < 480) return;
+	presence_flag = true;
+	ETS_GPIO_INTR_DISABLE();
 }
 
-bool onewire_handle() {
-	byte cmd;
-	presence_flag = false;
+bool onewire_handler() {
+	byte cmd; presence_flag = false;
 	if (onewire_mode == RISING) { 
-		if (!dRead(pin_onewire)) {
-			if(!slave.waitReset(1) || !slave.presenceDetection()) goto _exit;
-		}
+		if (!dRead(pin_onewire))
+			if(!slave.waitReset(1) || !slave.presenceDetection()) 
+				goto _exit;
 	};
 	if (!slave.recvAndProcessCmd((byte*)&reader_code, cmd)) goto _exit;
-	reader_count = cmd;
-	delay(5);
+	reader_count = cmd; delay(5);
 _exit:
 	ETS_GPIO_INTR_ENABLE();
 	return slave.error == slave.ONEWIRE_NO_ERROR;
